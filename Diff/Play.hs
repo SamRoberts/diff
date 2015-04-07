@@ -2,156 +2,163 @@
 
 module Diff.Play where
 
--- Type = Unit
---      | Long
---      | Boolean
---      | (Type, Type)
---      | Type => Type
---      | Map[Type, Type]
---      | Or3[Type, Type, Type]
---      | Diff[Type]      // should really be a type level function with Type as input, producing one of the other terms, as per below:
---
--- Note to self re identity changes: the paper does not define a unique identity element. Identity elements are with respect to a particular value.
--- So diff[A] in the worst case could be A, where A just represents the new item
---
---
---   diff[Unit]       = Unit
---   diff[Long]       = Long
---   diff[Boolean]    = Boolean
---   diff[(A,B)]      = (diff[A], diff[B])
---   diff[A => B]     = (A, diff[A]) => diff[B]
---   diff[Map[A,B]]   = Map[A, Or3[Unit, A, diff[A]]]
---   diff[Or3[A,B,C]] = Or3[diff[A], diff[B], diff[C]] or Or3[A,B,C] // need ability to change which alternative is present ... but what about the identity diff?
---   diff[Diff[A]]    = not meaningfull, as Diff shouldn't be an actual type, as per note above
---
--- Future types?
---      | String
---      | List[Type] and/or other collections of Type
---      | Map[Type, Type]
---      | records
---      | tuples of arbitrary arity
---      | optional types
---      | sum types
+import Control.Applicative ((<$>), (<*>))
+import Control.Monad.State (State, evalState)
+import Data.Dynamic (Dynamic, cast, fromDynamic)
+import qualified Data.Map as M
+import Data.Maybe (maybe)
+import Data.Typeable (Typeable)
 
 
--- So, what's the plan?
--- GADT representing expressions in the language, type parameter reprenting type of expression
--- Change type class, representing change structures for types
--- type families in Change type class, representing output type of Derive transform
--- actual Derive function in Change type class
+-----------------------------
+-- Type of diffs
+-----------------------------
+
+-- Ideally would be a closed type family, but need to update GHC and can't be bothered to do that now
+
+class Diff a where
+  type D a
+
+instance Diff () where
+  type D () = ()
+
+instance Diff Integer where
+  type D Integer = Integer
+
+instance (Diff a, Diff b) => Diff (a,b) where
+  type D (a,b) = (D a, D b)
+
+instance (Diff a, Diff b) => Diff (Either a b) where
+  type D (Either a b) = Either (Either (D a) (D b)) (Either a b)
+
+instance (Diff a, Diff b) => Diff (a -> b) where
+  type D (a -> b) = a -> D a -> D b
+
+-----------------------------
+-- Syntax
+-----------------------------
 
 data Exp :: * -> * where
-  Upd :: Change a => Exp a -> Exp (Derive a) -> Exp a
-  Del :: Change a => Exp a -> Exp a -> Exp (Derive a)
+  -- change structures
+  Upd :: Change a => Exp a -> Exp (D a) -> Exp a
+  Del :: Change a => Exp a -> Exp a -> Exp (D a)
 
+  -- unit
   U :: Exp ()
-  I :: Integer -> Exp Integer
 
+  -- integers
+  I :: Integer -> Exp Integer
+  Add :: Exp Integer -> Exp Integer -> Exp Integer
+
+  -- tuples
   Tup :: Exp a -> Exp b -> Exp (a,b)
+  Fst :: Exp (a,b) -> Exp a
+  Snd :: Exp (a,b) -> Exp b
+
+  -- eithers
   InL :: Exp a -> Exp (Either a b)
   InR :: Exp b -> Exp (Either a b)
+  FoldE :: Exp (a -> c) -> Exp (b -> c) -> Exp (Either a b) -> Exp c
 
-  -- So, how to evaluate variables?
-  -- Maybe a pass to assign globally unique names before doing derivation?
-  -- Doesn't guarantee that variable still exists in environment ...
-  -- Maybe a pass to make every free variable reference capture variable before doing derivation?
-  -- A free variable in what scope? Every variable is free in a small enough scope.
-  -- Scope of lambdas? Is that enough? What about let bindings?
-  -- Lambda and let are the only things which introduce named variables ... can I show that is enough?
-  Lam :: Var -> Exp b -> Exp (a -> b)
+  -- lambda calculus
+  Lam :: Exp b -> Exp (a -> b)
   App :: Exp (a -> b) -> Exp a -> Exp b
-  Let :: [Binding] -> Exp a -> Exp a
   Get :: Var -> Exp a
 
--- change structures
--- consider making Deriva a closed type family? Not even sure if current version is open or closed!
 
-class Change a where
-  type Derive a
-  update :: Exp a -> Exp (Derive a) -> Exp a
-  delta  :: Exp a -> Exp a -> Exp (Derive a)
+-- VSpace "guarantees" a separate namespace for vars and dvars
+-- We don't have Delta in original program: scouts honour!
+data Var =
+    BVar VSpace Int
+  | FVar VSpace String
 
-instance (Change a, Change b) => Change (a -> b) where
-  type Derive (a -> b) = a -> Derive a -> Derive b
-  update f df = Let
+data VSpace = Whole | Delta
 
-instance (Change a, Change b) => Change (Either a b) where
-  type Derive (Either a b) = Either (Either (Derive a) (Derive b)) (Either a b)
-
-  update (InL ea) (InL (InL dea)) = InL $ update ea dea
-  update (InL ea) (InR (InR eb))  = InR eb
-  update (InR eb) (InL (InR deb)) = InR $ update eb deb
-  update (InR eb) (InR (InL ea))  = InL ea
-
-  delta  (InL xa) (InL ya)        = InL $ InL $ delta xa ya
-  delta  (InL xa) (InR yb)        = InR $ InL xa
-  delta  (InR xb) (InL ya)        = InR $ InR xb
-  delta  (InR xb) (InR yb)        = InL $ InR $ delta xb yb
-
-instance (Change a, Change b) => Change (a,b) where
-  type Derive (a,b) = (Derive a, Derive b)
-  update (Tup ea eb) (Tup dea deb) = Tup (update ea dea) (update eb deb)
-  delta  (Tup xa xb) (Tup ya yb)   = Tup (delta  xa ya)  (delta  xb yb)
-
-instance Change Integer where
-  type Derive Integer = Integer
-  update (I x) (I dx) = I (x + dx)
-  delta  (I x) (I y)  = I (x - y)
-
-instance Change () where
-  type Derive () = ()
-  update U U = U
-  delta  U U = U
-
--- Vals
--- Untyped representation because not sure how to do environment any other way
-
-class Val a where
-  erase :: Exp a -> Untyped
-  cast  :: Untyped -> Exp a
-
-instance (Val a, Val b) => Val (Either a b) where
-  erase (InL ea) = UInL $ erase ea
-  erase (InR eb) = UInR $ erase eb
-  cast (UInL ua) = InL  $ cast  ua
-  cast (UInR ub) = InR  $ cast  ub
-
-instance (Val a, Val b) => Val (a,b) where
-  erase (Tup ea eb) = UTup (erase ea) (erase eb)
-  cast (UTup ua ub) = Tup  (cast ua) (cast ub)
-
-instance Val Integer where
-  erase (I i) = UI i
-  cast (UI i) = I  i
-
-instance Val () where
-  erase U = UU
-  cast UU = U
+freeNames :: [Var]
+freeNames = FVar Whole <$> (flip replicateM ['a'..'z'] =<< [1..])
 
 
--- all the crap that goes into making it work behind the scenes
+-----------------------------
+-- Evaluation
+-----------------------------
 
-data Untyped =
-    UUpd Untyped Untyped
-  | UDel Untyped Untyped
-  | UU
-  | UI Integer
-  | UTup Untyped Untyped
-  | UInL Untyped
-  | UInR Untyped
-  | ULam Var Untyped
-  | UApp Untyped Untyped
-  | ULet [Binding] Untyped
-  | UGet Var
+-- untyped environment
+data Env = Map Var Dynamic
 
--- guarantee a separate namespace for vars and dvars
--- We don't have DVars in original program: scouts honour!
-data Var = Var String | DVar String
+lookup :: Typeable a => Var -> Env -> Maybe (Exp a)
+lookup var = fromDynamic <=< M.lookup var
 
-data Binding = Bind Var Untyped
+data TypeErr = TypeErr
+               { teEnvVal :: Maybe (Var, TypeRep)
+               , teGetVal :: (Var, TypeRep)
+               }
 
-(:=) :: Val a => String -> Exp a -> Binding
-name := term = Bind (Var name) $ erase term
+data ErrUnbound =
+  ErrUnbound
+  { eUnbound :: Exp ()
+  , eDepth   :: Int
+  }
+
+validate :: Exp a -> Either ErrUnbound (Exp a)
+validate = vmapM checkVar
+  where
+    checkVar depth (BVar s n) | n <  depth = return $ BVar s n
+                              | s >= depth = Left $ ErrUnbound (BVar s n) depth
+    checkVar depth (FVar s n)              = Left $ ErrUnbound (FVar s n) depth
+
+-- Is this the signature I want? Need to know what type Var points to to actually map over it ...
+vmapM :: (Typeable a, Monad m) => (Int -> Var -> m (Exp b)) -> Exp a -> m (Exp a)
+vmapM f = go 0
+  where
+    tf :: Int -> Exp b -> m (Exp b)
+    tf n (Get v) = f n v
+
+    go i (Upd x dx)    = Upd <$> go i x <*> uniq i dx
+    go i (Del x y)     = Del <$> go i x <*> go i y
+    go _ U             = return U
+    go _ (I i)         = return $ I i
+    go i (Add x y)     = Add <$> go i x <*> go i y
+    go i (Tup x y)     = Tup <$> go i x <*> go i y
+    go i (Fst x)       = Fst <$> go i x
+    go i (Snd x)       = Snd <$> go i x
+    go i (InL x)       = InL <$> go i x
+    go i (InR y)       = InR <$> go i y
+    go i (FoldE f g x) = FoldE <$> go i f <*> go i g <*> go i x
+    go i (App f x)     = App <$> go i f <*> go i x
+    go i (Lam b)       = Lam <$> go (i+1) b
+    -- Does the cast work? Is it necesary?
+    --go i (Get v)       = maybe (return $ Get v) (f i) $ cast (Get v)
+    -- this *should* be a compile error, I think
+    go i (Get v)       = f i v
+
+
+-- update and delta
+-- these are evaluation functions. constructors are syntax.
+{-
+update :: Change a => Exp a -> Exp (D a) -> Exp a
+update (Add ea dea1) dea2       =
+update (InL ea) (InL (InL dea)) = InL $ update ea dea
+update (InL ea) (InR (InR eb))  = InR eb
+update (InR eb) (InL (InR deb)) = InR $ update eb deb
+update (InR eb) (InR (InL ea))  = InL ea
+update (Tup ea eb) (Tup dea deb) = Tup (update ea dea) (update eb deb)
+update (I x) (I dx) = I (x + dx)
+update U U = U
+
+
+delta :: Change a => Exp a -> Exp a -> Exp (D a)
+delta  (InL xa) (InL ya)        = InL $ InL $ delta xa ya
+delta  (InL xa) (InR yb)        = InR $ InL xa
+delta  (InR xb) (InL ya)        = InR $ InR xb
+delta  (InR xb) (InR yb)        = InL $ InR $ delta xb yb
+delta  (Tup xa xb) (Tup ya yb)   = Tup (delta  xa ya)  (delta  xb yb)
+delta  (I x) (I y)  = I (x - y)
+delta  U U = U
+
+
+-----------------------------
+-- Printing
+-----------------------------
 
 instance Show Var where
   show (Var x)  = x
@@ -180,3 +187,4 @@ instance Show Untyped where
   show (UApp ef ea)  = "(" ++ show ef ++ ") (" ++ show ea ++ ")"
   show (ULet bs ea)  = "let " ++ intercalate "; " (map show bs) ++ " in " ++ show ea
   show (UGet va)     = show va
+-}
