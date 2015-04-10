@@ -1,190 +1,158 @@
-{-# LANGUAGE KindSignatures, GADTs, TypeFamilies #-}
+{-# LANGUAGE DeriveFunctor, ViewPatterns #-}
 
 module Diff.Play where
 
-import Control.Applicative ((<$>), (<*>))
-import Control.Monad.State (State, evalState)
-import Data.Dynamic (Dynamic, cast, fromDynamic)
+import           Control.Applicative (Applicative, (<$>), (<*>))
+import qualified Control.Monad.Trans.State as S
 import qualified Data.Map as M
-import Data.Maybe (maybe)
-import Data.Typeable (Typeable)
-
 
 -----------------------------
--- Type of diffs
+-- Types
 -----------------------------
 
--- Ideally would be a closed type family, but need to update GHC and can't be bothered to do that now
+data Typ =
+    TU
+  | TI
+  | Typ :*:  Typ
+  | Typ :+:  Typ
+  | Typ :->: Typ
+  deriving (Show, Eq)
 
-class Diff a where
-  type D a
-
-instance Diff () where
-  type D () = ()
-
-instance Diff Integer where
-  type D Integer = Integer
-
-instance (Diff a, Diff b) => Diff (a,b) where
-  type D (a,b) = (D a, D b)
-
-instance (Diff a, Diff b) => Diff (Either a b) where
-  type D (Either a b) = Either (Either (D a) (D b)) (Either a b)
-
-instance (Diff a, Diff b) => Diff (a -> b) where
-  type D (a -> b) = a -> D a -> D b
+diff :: Typ -> Typ
+diff TU         = TU
+diff TI         = TI
+diff (x :*:  y) = diff x :*: diff y
+diff (x :+:  y) = (diff x :+: diff y) :+: (x :+: y)
+diff (x :->: y) = x :->: (diff x :->: diff y)
 
 -----------------------------
--- Syntax
+-- Expressions
 -----------------------------
 
-data Exp :: * -> * where
-  -- change structures
-  Upd :: Change a => Exp a -> Exp (D a) -> Exp a
-  Del :: Change a => Exp a -> Exp a -> Exp (D a)
-
+data Exp =
   -- unit
-  U :: Exp ()
+    U                 -- TU
 
   -- integers
-  I :: Integer -> Exp Integer
-  Add :: Exp Integer -> Exp Integer -> Exp Integer
+  | I Integer         -- TI
+  | Add Exp Exp       -- TI -> TI -> TI
 
   -- tuples
-  Tup :: Exp a -> Exp b -> Exp (a,b)
-  Fst :: Exp (a,b) -> Exp a
-  Snd :: Exp (a,b) -> Exp b
+  | Tup Exp Exp       -- t -> u -> t :*: u
+  | Fst Exp           -- t :*: u -> t
+  | Snd Exp           -- t :*: u -> u
 
   -- eithers
-  InL :: Exp a -> Exp (Either a b)
-  InR :: Exp b -> Exp (Either a b)
-  FoldE :: Exp (a -> c) -> Exp (b -> c) -> Exp (Either a b) -> Exp c
+  | InL Exp Typ       -- t -> t :+: u
+  | InR Typ Exp       -- u -> t :+: u
+  | FoldE Exp Exp Exp -- (t :->: a) -> (u :->: a) -> (t :+: u) -> a
 
-  -- lambda calculus
-  Lam :: Exp b -> Exp (a -> b)
-  App :: Exp (a -> b) -> Exp a -> Exp b
-  Get :: Var -> Exp a
+  -- changes
+  | Upd Exp Exp       -- t -> (diff t) -> t
+  | Dif Exp Exp       -- t -> t -> diff t
 
+-- lambda calculus
+  | App Exp Exp       -- (a :->: t) -> a -> t
+  | Lam Var Exp       -- na -> t -> (a :->: t)
+  | Ref Var           -- nt -> t
+  deriving (Show, Eq)
 
--- VSpace "guarantees" a separate namespace for vars and dvars
--- We don't have Delta in original program: scouts honour!
-data Var =
-    BVar VSpace Int
-  | FVar VSpace String
+data Var = Var Typ Name deriving (Show, Eq)
+data Name = Name String Integer deriving (Show, Eq, Ord)
 
-data VSpace = Whole | Delta
+data Env = Env (M.Map Name Exp) deriving (Show, Eq)
 
-freeNames :: [Var]
-freeNames = FVar Whole <$> (flip replicateM ['a'..'z'] =<< [1..])
+emptyEnv = Env M.empty
+
+insertBind :: Var -> Exp -> Env -> Env
+insertBind (Var _ name) exp (Env env) = Env $ M.insert name exp env
 
 
 -----------------------------
--- Evaluation
+-- Constructors
 -----------------------------
 
--- untyped environment
-data Env = Map Var Dynamic
+letIn :: Var -> Exp -> (Exp -> Exp) -> Exp
+letIn n a x = App (Lam n (x (Ref n))) a
 
-lookup :: Typeable a => Var -> Env -> Maybe (Exp a)
-lookup var = fromDynamic <=< M.lookup var
+var :: String -> Typ -> Var
+var name typ = Var typ (Name name 0)
 
-data TypeErr = TypeErr
-               { teEnvVal :: Maybe (Var, TypeRep)
-               , teGetVal :: (Var, TypeRep)
-               }
+-----------------------------
+-- General utilities
+-----------------------------
 
-data ErrUnbound =
-  ErrUnbound
-  { eUnbound :: Exp ()
-  , eDepth   :: Int
-  }
+distribute :: (Exp -> Exp) -> Exp -> Exp
+distribute _ U         = U
+distribute _ (I i)     = I i
+distribute f (Add x y) = Add (f x) (f y)
+distribute f (Tup x y) = Tup (f x) (f y)
+distribute f (Fst x)   = Fst (f x)
+distribute f (Snd x)   = Snd (f x)
+distribute f (InL x t) = InL (f x) t
+distribute f (InR t x) = InR t (f x)
+distribute f (FoldE x y z) = FoldE (f x) (f y) (f z)
+distribute f (Upd x y) = Upd (f x) (f y)
+distribute f (Dif x y) = Dif (f x) (f y)
+distribute f (App x y) = App (f x) (f y)
+distribute f (Lam n x) = Lam n (f x)
+distribute _ (Ref n)   = Ref n
 
-validate :: Exp a -> Either ErrUnbound (Exp a)
-validate = vmapM checkVar
+-----------------------------
+-- Sanity checks
+-----------------------------
+
+-- placeholder type check error
+data TypeError = TypeError deriving (Show, Eq)
+
+-- type check WITHOUT CHECKING NAMES
+-- need separate pass to ensure consistency of names
+-- suggestion: 1) typCheck, 2) unique names, 3) consistency of names
+typeCheck :: Exp ->  Either TypeError Typ
+typeCheck = ty
   where
-    checkVar depth (BVar s n) | n <  depth = return $ BVar s n
-                              | s >= depth = Left $ ErrUnbound (BVar s n) depth
-    checkVar depth (FVar s n)              = Left $ ErrUnbound (FVar s n) depth
+    ty U                                                          = Right TU
 
--- Is this the signature I want? Need to know what type Var points to to actually map over it ...
-vmapM :: (Typeable a, Monad m) => (Int -> Var -> m (Exp b)) -> Exp a -> m (Exp a)
-vmapM f = go 0
+    ty (I _)                                                      = Right TI
+    ty (Add (ty -> Right TI) (ty -> Right TI))                    = Right TI
+
+    ty (Tup (ty -> Right u) (ty -> Right v))                      = Right (u :*: v)
+    ty (Fst (ty -> Right (u :*: _)))                              = Right u
+    ty (Snd (ty -> Right (_ :*: v)))                              = Right v
+
+    ty (FoldE (ty -> Right (u1 :->: t1)) (ty -> Right (v2 :->: t2)) (ty -> Right (u3 :+: v3))) | u1 == u3 && v2 == v3 && t1== t2 = Right t1
+    ty (InL (ty -> Right u) v)                                    = Right (u :+: v)
+    ty (InR u (ty -> Right v))                                    = Right (u :+: v)
+
+    ty (App (ty -> Right (u1 :->: t)) (ty -> Right u2)) | u1 == u2 = Right t
+    ty (Lam (Var u _) (ty -> Right t))                            = Right (u :->: t)
+    ty (Ref (Var t _))                                            = Right t
+
+    ty (Upd (ty -> Right t) (ty -> Right dt)) | dt == diff t      = Right t
+    ty (Dif (ty -> Right t1) (ty -> Right t2)) | t1 == t2         = Right (diff t1)
+
+    ty _                                                          = Left TypeError
+
+-- assumes that the numbers in Names are meaningless
+-- and assigns unique
+uniqNames :: Exp -> Exp
+uniqNames x = S.evalState (go emptyEnv x) M.empty
   where
-    tf :: Int -> Exp b -> m (Exp b)
-    tf n (Get v) = f n v
+    fresh :: Name -> S.State (M.Map String Name) Name
+    fresh (Name id _) = S.state $ \olds ->
+      let new = maybe (Name id 0) (\(Name _ i) -> Name id (i+1)) (M.lookup id olds)
+          updated = M.insert id new olds
+      in (new, updated)
 
-    go i (Upd x dx)    = Upd <$> go i x <*> uniq i dx
-    go i (Del x y)     = Del <$> go i x <*> go i y
-    go _ U             = return U
-    go _ (I i)         = return $ I i
-    go i (Add x y)     = Add <$> go i x <*> go i y
-    go i (Tup x y)     = Tup <$> go i x <*> go i y
-    go i (Fst x)       = Fst <$> go i x
-    go i (Snd x)       = Snd <$> go i x
-    go i (InL x)       = InL <$> go i x
-    go i (InR y)       = InR <$> go i y
-    go i (FoldE f g x) = FoldE <$> go i f <*> go i g <*> go i x
-    go i (App f x)     = App <$> go i f <*> go i x
-    go i (Lam b)       = Lam <$> go (i+1) b
-    -- Does the cast work? Is it necesary?
-    --go i (Get v)       = maybe (return $ Get v) (f i) $ cast (Get v)
-    -- this *should* be a compile error, I think
-    go i (Get v)       = f i v
+    go :: Env -> Exp -> S.State (M.Map String Name) Exp
+    go env U             = return U
 
+    go env i@(I _)       = return i
+    go env (Add x y)     = Add <$> go env x <*> go env y
 
--- update and delta
--- these are evaluation functions. constructors are syntax.
-{-
-update :: Change a => Exp a -> Exp (D a) -> Exp a
-update (Add ea dea1) dea2       =
-update (InL ea) (InL (InL dea)) = InL $ update ea dea
-update (InL ea) (InR (InR eb))  = InR eb
-update (InR eb) (InL (InR deb)) = InR $ update eb deb
-update (InR eb) (InR (InL ea))  = InL ea
-update (Tup ea eb) (Tup dea deb) = Tup (update ea dea) (update eb deb)
-update (I x) (I dx) = I (x + dx)
-update U U = U
+    go env (Tup x y)     = Tup <$> go env x <*> go env y
+    go env (Fst x)       = Fst <$> go env x
+    go env (Snd x)       = Snd <$> go env x
 
+    go _ _ = undefined
 
-delta :: Change a => Exp a -> Exp a -> Exp (D a)
-delta  (InL xa) (InL ya)        = InL $ InL $ delta xa ya
-delta  (InL xa) (InR yb)        = InR $ InL xa
-delta  (InR xb) (InL ya)        = InR $ InR xb
-delta  (InR xb) (InR yb)        = InL $ InR $ delta xb yb
-delta  (Tup xa xb) (Tup ya yb)   = Tup (delta  xa ya)  (delta  xb yb)
-delta  (I x) (I y)  = I (x - y)
-delta  U U = U
-
-
------------------------------
--- Printing
------------------------------
-
-instance Show Var where
-  show (Var x)  = x
-  show (DVar x) = "d" ++ x
-
-instance Show Binding where
-  show (Bind var term) = show var ++ " = " ++ show term
-
--- need to have some sort of priority so I can avoid spurious brackets
--- need to have some sort of "margin", so I can properly nest indented things
--- in absense of margin, show let bindings is going to be some ugly all-on-one-line thing
--- doing show on untyped repr, because we need to show let beindings, which
--- are untyped anyway
-instance Val a => Show (Exp a) where
-  show = show . erase
-
-instance Show Untyped where
-  show (UUpd ea dea) = show ea ++ " + " ++ show dea
-  show (UDel xa ya)  = show xa ++ " - " ++ show ya
-  show UU            = "()"
-  show (UI i)        = show i
-  show (UTup ea eb)  = "(" ++ show ea ++ "," ++ show eb ++ ")"
-  show (UInL ea)     = "↰ " ++ show ea
-  show (UInR eb)     = "↱ " ++ show eb
-  show (ULam va eb)  = "λ" ++ show va ++ " → " ++ show eb
-  show (UApp ef ea)  = "(" ++ show ef ++ ") (" ++ show ea ++ ")"
-  show (ULet bs ea)  = "let " ++ intercalate "; " (map show bs) ++ " in " ++ show ea
-  show (UGet va)     = show va
--}
