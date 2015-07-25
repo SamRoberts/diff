@@ -5,6 +5,7 @@ module Diff.Play where
 import           Control.Applicative (Applicative, (<$>), (<*>))
 import qualified Control.Monad.Trans.State as S
 import qualified Data.Map as M
+import           Data.Maybe (fromJust) -- TODO remove need for this function
 
 -----------------------------
 -- Types
@@ -64,8 +65,8 @@ data Env = Env (M.Map Name Exp) deriving (Show, Eq)
 
 emptyEnv = Env M.empty
 
-insertBind :: Var -> Exp -> Env -> Env
-insertBind (Var _ name) exp (Env env) = Env $ M.insert name exp env
+addBind :: Name -> Exp -> Env -> Env
+addBind name exp (Env env) = Env $ M.insert name exp env
 
 
 -----------------------------
@@ -82,21 +83,21 @@ var name typ = Var typ (Name name 0)
 -- General utilities
 -----------------------------
 
-distribute :: (Exp -> Exp) -> Exp -> Exp
-distribute _ U         = U
-distribute _ (I i)     = I i
-distribute f (Add x y) = Add (f x) (f y)
-distribute f (Tup x y) = Tup (f x) (f y)
-distribute f (Fst x)   = Fst (f x)
-distribute f (Snd x)   = Snd (f x)
-distribute f (InL x t) = InL (f x) t
-distribute f (InR t x) = InR t (f x)
-distribute f (FoldE x y z) = FoldE (f x) (f y) (f z)
-distribute f (Upd x y) = Upd (f x) (f y)
-distribute f (Dif x y) = Dif (f x) (f y)
-distribute f (App x y) = App (f x) (f y)
-distribute f (Lam n x) = Lam n (f x)
-distribute _ (Ref n)   = Ref n
+distributeA :: Applicative a => (Exp -> a Exp) -> Exp -> a Exp
+distributeA _ U         = pure U
+distributeA _ (I i)     = pure $ I i
+distributeA f (Add x y) = Add <$> f x <*> f y
+distributeA f (Tup x y) = Tup <$> f x <*> f y
+distributeA f (Fst x)   = Fst <$> f x
+distributeA f (Snd x)   = Snd <$> f x
+distributeA f (InL x t) = InL <$> f x <*> pure t
+distributeA f (InR t x) = InR <$> pure t <*> f x
+distributeA f (FoldE x y z) = FoldE <$> f x <*> f y <*> f z
+distributeA f (Upd x y) = Upd <$> f x <*> f y
+distributeA f (Dif x y) = Dif <$> f x <*> f y
+distributeA f (App x y) = App <$> f x <*> f y
+distributeA f (Lam n x) = Lam n <$> f x
+distributeA _ (Ref n)   = pure $ Ref n
 
 -----------------------------
 -- Sanity checks
@@ -136,23 +137,21 @@ typeCheck = ty
 -- assumes that the numbers in Names are meaningless
 -- and assigns unique
 uniqNames :: Exp -> Exp
-uniqNames x = S.evalState (go emptyEnv x) M.empty
+uniqNames x = S.evalState (go M.empty x) M.empty
   where
-    fresh :: Name -> S.State (M.Map String Name) Name
-    fresh (Name id _) = S.state $ \olds ->
-      let new = maybe (Name id 0) (\(Name _ i) -> Name id (i+1)) (M.lookup id olds)
-          updated = M.insert id new olds
+    fresh :: String -> S.State (M.Map String Name) Name
+    fresh name = S.state $ \olds ->
+      let new = maybe (Name name 0) (\(Name _ i) -> Name name (i+1)) (M.lookup name olds)
+          updated = M.insert name new olds
       in (new, updated)
 
-    go :: Env -> Exp -> S.State (M.Map String Name) Exp
-    go env U             = return U
+    go :: M.Map String Name -> Exp -> S.State (M.Map String Name) Exp
+    go fullNames (Lam (Var typ (Name name _)) body) = do
+      freshName <- fresh name
+      Lam (Var typ freshName) <$> go (M.insert name freshName fullNames) body
 
-    go env i@(I _)       = return i
-    go env (Add x y)     = Add <$> go env x <*> go env y
+    -- TODO need additional effect to handle name not found error!
+    go fullNames (Ref (Var typ (Name name _))) = return $ Ref $ Var typ $ fromJust $ M.lookup name fullNames
 
-    go env (Tup x y)     = Tup <$> go env x <*> go env y
-    go env (Fst x)       = Fst <$> go env x
-    go env (Snd x)       = Snd <$> go env x
-
-    go _ _ = undefined
+    go fullNames other = distributeA (go fullNames) other
 
