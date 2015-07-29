@@ -3,7 +3,9 @@
 module Diff.Play where
 
 import           Control.Applicative (Applicative, (<$>), (<*>))
+import           Control.Monad.Trans.State (State)
 import qualified Control.Monad.Trans.State as S
+import           Data.Map (Map)
 import qualified Data.Map as M
 import           Data.Maybe (fromJust) -- TODO remove need for this function
 
@@ -61,7 +63,7 @@ data Exp =
 data Var = Var Typ Name deriving (Show, Eq)
 data Name = Name String Integer deriving (Show, Eq, Ord)
 
-data Env = Env (M.Map Name Exp) deriving (Show, Eq)
+data Env = Env (Map Name Exp) deriving (Show, Eq)
 
 emptyEnv = Env M.empty
 
@@ -139,13 +141,13 @@ typeCheck = ty
 uniqNames :: Exp -> Exp
 uniqNames x = S.evalState (go M.empty x) M.empty
   where
-    fresh :: String -> S.State (M.Map String Name) Name
+    fresh :: String -> State (Map String Name) Name
     fresh name = S.state $ \olds ->
       let new = maybe (Name name 0) (\(Name _ i) -> Name name (i+1)) (M.lookup name olds)
           updated = M.insert name new olds
       in (new, updated)
 
-    go :: M.Map String Name -> Exp -> S.State (M.Map String Name) Exp
+    go :: Map String Name -> Exp -> State (Map String Name) Exp
     go fullNames (Lam (Var typ (Name name _)) body) = do
       freshName <- fresh name
       Lam (Var typ freshName) <$> go (M.insert name freshName fullNames) body
