@@ -8,6 +8,8 @@ import qualified Control.Monad.Trans.State as S
 import           Data.Map (Map)
 import qualified Data.Map as M
 import           Data.Maybe (fromJust) -- TODO remove need for this function
+import           Data.Text (Text)
+import qualified Data.Text as T
 
 -----------------------------
 -- Types
@@ -61,7 +63,7 @@ data Exp =
   deriving (Show, Eq)
 
 data Var = Var Typ Name deriving (Show, Eq)
-data Name = Name String Integer deriving (Show, Eq, Ord)
+data Name = Name Text Integer deriving (Show, Eq, Ord)
 
 data Env = Env (Map Name Exp) deriving (Show, Eq)
 
@@ -78,7 +80,7 @@ addBind name exp (Env env) = Env $ M.insert name exp env
 letIn :: Var -> Exp -> (Exp -> Exp) -> Exp
 letIn n a x = App (Lam n (x (Ref n))) a
 
-var :: String -> Typ -> Var
+var :: Text -> Typ -> Var
 var name typ = Var typ (Name name 0)
 
 -----------------------------
@@ -141,13 +143,13 @@ typeCheck = ty
 uniqNames :: Exp -> Exp
 uniqNames x = S.evalState (go M.empty x) M.empty
   where
-    fresh :: String -> State (Map String Name) Name
+    fresh :: Text -> State (Map Text Name) Name
     fresh name = S.state $ \olds ->
       let new = maybe (Name name 0) (\(Name _ i) -> Name name (i+1)) (M.lookup name olds)
           updated = M.insert name new olds
       in (new, updated)
 
-    go :: Map String Name -> Exp -> State (Map String Name) Exp
+    go :: Map Text Name -> Exp -> State (Map Text Name) Exp
     go fullNames (Lam (Var typ (Name name _)) body) = do
       freshName <- fresh name
       Lam (Var typ freshName) <$> go (M.insert name freshName fullNames) body
